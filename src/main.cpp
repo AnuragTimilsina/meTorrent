@@ -1,4 +1,6 @@
 #include <iostream>
+#include <fstream> 
+#include <filesystem>
 #include <string>
 #include <vector>
 #include <cctype>
@@ -109,7 +111,20 @@ int main(int argc, char* argv[]) {
         json decoded_value = decode_bencoded_value(encoded_value);
         std::cout << decoded_value.dump() << std::endl;
 
-    } else {
+    } else if (command == "info") {
+        std::string file_name = argv[2];
+        std::ifstream file(file_name, std::ios::binary);
+        std::filesystem::path file_path(file_name);
+
+        std::string info(std::filesystem::file_size(file_path), '_');
+        file.read(info.data(), std::filesystem::file_size(file_path));
+
+        json torrent_info = decode_bencoded_value(info); 
+        std::cout << "Tracker URL: " << torrent_info["announce"].dump().substr(1, torrent_info["announce"].dump().size() - 2) << std::endl;
+        std::cout << "Length: " << torrent_info["info"]["length"] << std::endl;
+    } 
+    
+    else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;
     }

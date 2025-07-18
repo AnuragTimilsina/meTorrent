@@ -209,6 +209,24 @@ int main(int argc, char* argv[]) {
         std::cout << "Tracker URL: " << torrent["announce"].get<std::string>() << std::endl;
         std::cout << "Length: " << info_dict["length"] << std::endl;
         std::cout << "Info Hash: " << info_hash << std::endl;
+
+        // Piece length and piece hash calculation logic
+        std::cout << "Piece Length: " << info_dict["piece length"] << std::endl;
+        
+        // Decode piece hashes
+        std::string pieces_raw = info_dict["pieces"];
+
+        std::cout << "Piece Hashes: " << std::endl;
+        for(size_t i = 0; i < pieces_raw.size(); i += 20) {
+            std::string piece_hash = pieces_raw.substr(i, 20);
+            
+            std::ostringstream oss;
+            for (unsigned char c: piece_hash) {
+                oss << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)c;
+            }
+            std::cout << oss.str() << std::endl;
+        }
+
     } else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;

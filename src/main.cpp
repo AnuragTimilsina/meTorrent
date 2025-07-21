@@ -1,7 +1,7 @@
 #include <iostream>
 #include <openssl/sha.h> // for SHA1
-#include <iomanip> // for std::setw and std::setfill
-#include <sstream> // for std::ostringstream
+#include <iomanip>
+#include <sstream>
 #include <fstream> 
 #include <filesystem>
 #include <string>
@@ -9,43 +9,134 @@
 #include <cctype>
 #include <cstdlib>
 #include <stdexcept>
+#include <curl/curl.h>
+#include <arpa/inet.h>
 
 #include "lib/nlohmann/json.hpp"
 
 using json = nlohmann::json;
 
-// Forward declaration of the recursive helper function.
+// Function declarations
 json decode_bencoded_value(const std::string& s, size_t &pos);
-
-// Forward declaration of the json object to bencode 
+json decode_bencoded_value(const std::string& s);
 std::string json_to_bencode(const json& j);
 
-// Convert raw SHA1 digest to a hex string.
-std::string sha1_to_hex(const std::string& input);
-
-
-// Helper function to convert SHA1 digest to a hex string.
+// SHA1 Hash
 std::string sha1_to_hex(const std::string& input) {
-    unsigned char hash[SHA_DIGEST_LENGTH]; // Defined in OpenSSL as 20. SHA-1 produces a 160-bit hash. (20 bytes)
+    unsigned char hash[SHA_DIGEST_LENGTH];
     SHA1(reinterpret_cast<const unsigned char*>(input.c_str()), input.size(), hash);
-
     std::ostringstream oss;
-    for (int i = 0; i < SHA_DIGEST_LENGTH; ++i) {
+    for (int i = 0; i < SHA_DIGEST_LENGTH; ++i)
         oss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
+    return oss.str();
+}
+
+// URL encode
+std::string url_encode(const std::string &value) {
+    std::ostringstream escaped;
+    escaped.fill('0');
+    escaped << std::hex;
+    for (char c : value) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (isalnum(uc) || c == '-' || c == '_' || c == '.' || c == '~') {
+            escaped << c;
+        } else {
+            escaped << '%' << std::setw(2) << int(uc);
+        }
+    }
+    return escaped.str();
+}
+
+// File read
+std::string read_file(const std::string &filename) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Could not open file: " + filename);
+    }
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
+}
+
+// curl write callback (FIXED)
+size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t total_size = size * nmemb;
+    std::string *output = static_cast<std::string *>(userp);
+    output->append((char *)contents, total_size);
+    return total_size;
+}
+
+// parse peers
+std::string parse_peers(const std::string &peers) {
+    std::ostringstream oss;
+    for (size_t i = 0; i + 6 <= peers.size(); i += 6) {
+        uint8_t ip_bytes[4];
+        uint16_t port;
+
+        memcpy(ip_bytes, &peers[i], 4);
+        memcpy(&port, &peers[i + 4], 2);
+
+        std::string ip = std::to_string(ip_bytes[0]) + "." +
+                         std::to_string(ip_bytes[1]) + "." +
+                         std::to_string(ip_bytes[2]) + "." +
+                         std::to_string(ip_bytes[3]);
+
+        port = ntohs(port);
+        oss << ip << ":" << port << std::endl;
     }
     return oss.str();
 }
 
+// Bencode decoder
+json decode_bencoded_value(const std::string& s, size_t &pos) {
+    if (std::isdigit(s[pos])) {
+        size_t colon = s.find(':', pos);
+        int len = std::stoi(s.substr(pos, colon - pos));
+        pos = colon + 1;
+        std::string str = s.substr(pos, len);
+        pos += len;
+        return json(str);
+    } else if (s[pos] == 'i') {
+        pos++;
+        size_t ePos = s.find('e', pos);
+        long long value = std::stoll(s.substr(pos, ePos - pos));
+        pos = ePos + 1;
+        return json(value);
+    } else if (s[pos] == 'l') {
+        pos++;
+        json arr = json::array();
+        while (s[pos] != 'e') {
+            arr.push_back(decode_bencoded_value(s, pos));
+        }
+        pos++;
+        return arr;
+    } else if (s[pos] == 'd') {
+        pos++;
+        json obj = json::object();
+        while (s[pos] != 'e') {
+            json key = decode_bencoded_value(s, pos);
+            json value = decode_bencoded_value(s, pos);
+            obj[key.get<std::string>()] = value;
+        }
+        pos++;
+        return obj;
+    } else {
+        throw std::runtime_error("Unhandled encoded value: " + s);
+    }
+}
 
-// Recursive-descent decoder that processes one bencoded element starting at pos
+json decode_bencoded_value(const std::string& s) {
+    size_t pos = 0;
+    return decode_bencoded_value(s, pos);
+}
+
+// JSON → Bencode
 std::string json_to_bencode(const json& j) {
     if (j.is_string()) {
         const std::string& str = j.get<std::string>();
         return std::to_string(str.size()) + ":" + str;
-
     } else if (j.is_number_integer()) {
         return "i" + std::to_string(j.get<long long>()) + "e";
-
     } else if (j.is_array()) {
         std::string result = "l";
         for (const auto& item : j) {
@@ -53,7 +144,6 @@ std::string json_to_bencode(const json& j) {
         }
         result += "e";
         return result;
-
     } else if (j.is_object()) {
         std::string result = "d";
         std::vector<std::string> keys;
@@ -61,124 +151,34 @@ std::string json_to_bencode(const json& j) {
             keys.push_back(it.key());
         }
         std::sort(keys.begin(), keys.end());
-
         for (const std::string& key : keys) {
             result += std::to_string(key.size()) + ":" + key;
             result += json_to_bencode(j.at(key));
         }
-
         result += "e";
         return result;
-
-    } else if (j.is_null()) {
-        throw std::runtime_error("Cannot bencode null values");
-
-    } else if (j.is_boolean()) {
-        throw std::runtime_error("Cannot bencode boolean values");
-
-    } else if (j.is_number_float()) {
-        throw std::runtime_error("Cannot bencode floating-point values");
-
     } else {
         throw std::runtime_error("Unsupported JSON type for bencoding");
     }
 }
 
-
-// Recursive-descent decoder that processes one bencoded element starting at pos
-json decode_bencoded_value(const std::string& s, size_t &pos) {
-    if (std::isdigit(s[pos])) {
-        // Decode a bencoded string: <length>:<string>
-        size_t colon = s.find(':', pos);
-        if (colon == std::string::npos) {
-            throw std::runtime_error("Invalid string encoding: " + s);
-        }
-        int len = std::stoi(s.substr(pos, colon - pos));
-        pos = colon + 1; // Move past the colon
-        std::string str = s.substr(pos, len);
-        pos += len; // Move past the string characters
-        return json(str);
-        
-    } else if (s[pos] == 'i') {
-        // Decode an integer: i<digits>e
-        pos++; // skip 'i'
-        size_t ePos = s.find('e', pos);
-        if (ePos == std::string::npos) {
-            throw std::runtime_error("Invalid integer encoding: " + s);
-        }
-        long long value = std::stoll(s.substr(pos, ePos - pos));
-        pos = ePos + 1; // skip past 'e'
-        return json(value);
-        
-    } else if (s[pos] == 'l') {
-        // Decode a list: l<elements>e
-        pos++; // skip initial 'l'
-        json arr = json::array();
-        while (s[pos] != 'e') {
-            arr.push_back(decode_bencoded_value(s, pos)); // recursively decode each element
-        }
-        pos++; // skip the trailing 'e'
-        return arr;
-      
-    } else if (s[pos] == 'd') {
-        // Decode a dictionary: d<key1><value1><key2><value2>...e
-        pos++; // skip initial 'd'
-        json obj = json::object();
-        while (s[pos] != 'e') {
-            // Decode key
-            json key = decode_bencoded_value(s, pos);
-            if (!key.is_string()) { 
-                throw std::runtime_error("Dictionary keys must be strings: " + s);
-            }
-            // Decode value
-            json value = decode_bencoded_value(s, pos);
-            obj[key.get<std::string>()] = value; // Add to the object
-        }
-        pos++; // skip the trailing 'e'
-        return obj;
-    
-    } else {
-        throw std::runtime_error("Unhandled encoded value: " + s);
-    }
-}
-
-
-// Wrapper function: starts decoding at the beginning of the string.
-json decode_bencoded_value(const std::string& s) {
-    size_t pos = 0;
-    return decode_bencoded_value(s, pos);
-}
-
-
+// MAIN
 int main(int argc, char* argv[]) {
-    // Flush output immediately
-
-    // In some environments (like automated testers), 
-    // you don’t want output to be buffered. 
-    // You want to see logs right away.
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
 
-
-    // Shows usage help if no arguments are provided by the user in command line.
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " decode <encoded_value>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <decode|info|peers> <args>" << std::endl;
         return 1;
     }
 
     std::string command = argv[1];
 
     if (command == "decode") {
-        // "decode" needs another argument: the bencoded value to decode. 
-        // If not provided, show usage help.
         if (argc < 3) {
             std::cerr << "Usage: " << argv[0] << " decode <encoded_value>" << std::endl;
             return 1;
         }
-
-        std::cerr << "Logs from your program will appear here!" << std::endl;
-
-        // Actual decoding here. 
         std::string encoded_value = argv[2];
         json decoded_value = decode_bencoded_value(encoded_value);
         std::cout << decoded_value.dump() << std::endl;
@@ -190,36 +190,21 @@ int main(int argc, char* argv[]) {
         }
 
         std::string file_name = argv[2];
-        std::ifstream file(file_name, std::ios::binary);
-        if (!file) {
-            std::cerr << "Failed to open file: " << file_name << std::endl;
-            return 1;
-        }
-
-        std::filesystem::path file_path(file_name);
-        std::string buffer(std::filesystem::file_size(file_path), '_');
-        file.read(buffer.data(), buffer.size());
-
+        std::string buffer = read_file(file_name);
         json torrent = decode_bencoded_value(buffer);
         json info_dict = torrent["info"];
-
         std::string bencoded_info = json_to_bencode(info_dict);
         std::string info_hash = sha1_to_hex(bencoded_info);
 
         std::cout << "Tracker URL: " << torrent["announce"].get<std::string>() << std::endl;
         std::cout << "Length: " << info_dict["length"] << std::endl;
         std::cout << "Info Hash: " << info_hash << std::endl;
-
-        // Piece length and piece hash calculation logic
         std::cout << "Piece Length: " << info_dict["piece length"] << std::endl;
-        
-        // Decode piece hashes
-        std::string pieces_raw = info_dict["pieces"];
 
+        std::string pieces_raw = info_dict["pieces"];
         std::cout << "Piece Hashes: " << std::endl;
         for(size_t i = 0; i < pieces_raw.size(); i += 20) {
             std::string piece_hash = pieces_raw.substr(i, 20);
-            
             std::ostringstream oss;
             for (unsigned char c: piece_hash) {
                 oss << std::hex << std::setw(2) << std::setfill('0') << (int)(unsigned char)c;
@@ -227,8 +212,63 @@ int main(int argc, char* argv[]) {
             std::cout << oss.str() << std::endl;
         }
 
+    }  else if (command == "peers") {
+        if (argc < 3) {
+            std::cerr << "Usage: " << argv[0] << " peers <file.torrent>" << std::endl;
+            return 1;
+        }
+
+        std::string file_name = argv[2];
+        std::string buffer = read_file(file_name);
+        json torrent = decode_bencoded_value(buffer);
+        json info_dict = torrent["info"];
+        std::string bencoded_info = json_to_bencode(info_dict);
+
+        unsigned char hash[SHA_DIGEST_LENGTH];
+        SHA1(reinterpret_cast<const unsigned char *>(bencoded_info.c_str()), bencoded_info.size(), hash);
+        std::string info_hash(reinterpret_cast<char *>(hash), SHA_DIGEST_LENGTH);
+
+        std::string peer_id = "-PC0001-123456789012";
+        int port = 6881;
+        int left = info_dict["length"].get<int>();
+
+        std::ostringstream url;
+        url << torrent["announce"].get<std::string>()
+            << "?info_hash=" << url_encode(info_hash)
+            << "&peer_id=" << url_encode(peer_id)
+            << "&port=" << port
+            << "&uploaded=0&downloaded=0"
+            << "&left=" << left
+            << "&compact=1";
+
+        CURL *curl = curl_easy_init();
+        std::string response;
+
+        if (curl) {
+            curl_easy_setopt(curl, CURLOPT_URL, url.str().c_str());
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+            CURLcode res = curl_easy_perform(curl);
+            if (res != CURLE_OK) {
+                std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << std::endl;
+                return 1;
+            }
+            curl_easy_cleanup(curl);
+        }
+
+        json tracker_response = decode_bencoded_value(response);
+
+        if (!tracker_response.contains("peers") || !tracker_response["peers"].is_string()) {
+            std::cerr << "Tracker response does not contain a valid 'peers' string." << std::endl;
+            return 1;
+        }
+
+        std::string peers_compact = tracker_response["peers"];
+        std::string peer_list = parse_peers(peers_compact);
+        std::cout << peer_list << std::endl;
+        
     } else {
-        std::cerr << "unknown command: " << command << std::endl;
+        std::cerr << "Unknown command: " << command << std::endl;
         return 1;
     }
 

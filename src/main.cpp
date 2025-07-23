@@ -12,6 +12,13 @@
 #include <curl/curl.h>
 #include <arpa/inet.h>
 
+#include <random>
+#include <cstring> // For memcpy
+#include <netinet/in.h> // For htons, sockadder_in
+#include <sys/socket.h> 
+#include <unistd.h> 
+#include <netdb.h>
+
 #include "lib/nlohmann/json.hpp"
 
 using json = nlohmann::json;
@@ -45,6 +52,18 @@ std::string url_encode(const std::string &value) {
         }
     }
     return escaped.str();
+}
+
+// Utility: generate 20 random bytes
+std::string generate_peer_id() {
+    std::string peer_id = "-PC0001-"; // Prefix (you can change this)
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 255);
+    while (peer_id.size() < 20){
+        peer_id += static_cast<char>(dis(gen));
+    }
+    return peer_id;
 }
 
 // File read
@@ -267,7 +286,112 @@ int main(int argc, char* argv[]) {
         std::string peer_list = parse_peers(peers_compact);
         std::cout << peer_list << std::endl;
         
-    } else {
+    } else if (command == "handshake"){
+        if (argc < 4){
+            std::cerr << "Usage: " << argv[0] << "handshake <file.torent> <ip:port>" << std::endl;
+            return 1;   
+        }
+
+        std::string file_name = argv[2]; 
+        std::string peer_addr = argv[3];
+        std::string buffer = read_file(file_name);
+        json torrent = decode_bencoded_value(buffer);
+        json info_dict = torrent["info"];
+        std::string bencoded_info = json_to_bencode(info_dict);
+
+        // Raw 20-byte SHA1 info hash
+        unsigned char hash[SHA_DIGEST_LENGTH];
+        SHA1(reinterpret_cast<const unsigned char *>(bencoded_info.c_str()), bencoded_info.size(), hash);
+        std::string info_hash(reinterpret_cast<char *>(hash), 20);
+
+        // Generate peer ID
+        std::string peer_id = generate_peer_id();
+
+        // Build the handshake
+        std::string handshake;
+        handshake += static_cast<char>(19); // 1 byte length
+        handshake += "BitTorrent protocol"; // 19 bytes protocol name
+        handshake += std::string(8, '\0'); // 8 reserved bytes
+        handshake += info_hash; // 20 bytes info hash
+        handshake += peer_id; // 20 bytes peer ID
+
+        // Extract IP and port
+        size_t colon_pos = peer_addr.find(":");
+        if (colon_pos == std::string::npos) {
+            std::cerr << "Invalid peer address format. Use <ip>:<port>."<< std::endl;
+            return 1;
+        }
+        std::string ip = peer_addr.substr(0, colon_pos);
+        int port = std::stoi(peer_addr.substr(colon_pos + 1));
+
+        // Setup TCP socket
+
+            //  Function: socket(domain, type, protocol)
+            // AF_INET → IPv4
+            // SOCK_STREAM → TCP
+            // 0 → Default protocol (for TCP, this is fine)
+            // Returns: Socket file descriptor or -1 on failure.
+
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            perror("Socket creation failed");
+            return 1;
+        }
+
+        // Structure to store IPv4 address and port info. 
+
+        // struct sockaddr_in {
+        //     short sin_family;       // Address family (AF_INET)
+        //     unsigned short sin_port;// Port number (in network byte order)
+        //     struct in_addr sin_addr;// IP address
+        //     char sin_zero[8];       // Padding (not used)
+        // };
+
+        sockaddr_in server_addr{};
+        server_addr.sin_family = AF_INET;
+
+        // converts the port from host byte order to network byte order (big-endian), which is needed for TCP/IP.
+        server_addr.sin_port = htons(port);
+
+        // Converts a string IP address (e.g., "104.21.13.78") to binary format and stores it in sin_addr
+        inet_pton(AF_INET, ip.c_str(), &server_addr.sin_addr); 
+
+        if (connect(sock, (sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+            perror("Connection failed");
+            close(sock);
+            return 1;
+        }
+
+        // Send handshake
+        ssize_t sent = send(sock, handshake.c_str(), handshake.size(), 0);
+        if (sent < 0) {
+            perror("Send failed");
+            close(sock);
+            return 1;
+        }
+
+        // Receive handshake response
+        char response[68]; // 1 byte length + 19 bytes protocol + 8 reserved + 20 bytes info hash + 20 bytes peer ID
+        ssize_t received = recv(sock, response, sizeof(response), 0);
+        if (received < 0) {
+            perror("Receive failed");
+            close(sock);
+            return 1;
+        } 
+
+        close(sock);
+
+        // Extract and print peer ID as a hex string
+        std::ostringstream oss;
+        for (int i = 48; i < 68; ++i) { // Peer ID starts at byte 48
+            oss << std::hex << std::setw(2) << std::setfill('0') << (static_cast<unsigned int>(static_cast<unsigned char>(response[i])));
+        }
+        
+        std::cout << "Peer ID: " << oss.str() << std::endl;
+
+    } 
+    
+    else {
         std::cerr << "Unknown command: " << command << std::endl;
         return 1;
     }

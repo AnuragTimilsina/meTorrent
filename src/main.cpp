@@ -17,6 +17,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <netdb.h>
+#include <sys/time.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <chrono>
 
 #include "lib/nlohmann/json.hpp"
 
@@ -226,6 +230,10 @@ public:
             return -1;
         }
         
+        // Set socket to non-blocking for faster connection timeout
+        int flags = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+        
         sockaddr_in server_addr{};
         server_addr.sin_family = AF_INET;
         server_addr.sin_port = htons(peer.port);
@@ -236,11 +244,38 @@ public:
             return -1;
         }
         
-        if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        int result = connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr));
+        if (result < 0 && errno != EINPROGRESS) {
             std::cerr << "Connection to " << peer.to_string() << " failed: " << strerror(errno) << std::endl;
             close(sock);
             return -1;
         }
+        
+        // Wait for connection with short timeout
+        fd_set write_fds;
+        FD_ZERO(&write_fds);
+        FD_SET(sock, &write_fds);
+        
+        struct timeval timeout;
+        timeout.tv_sec = 3;  // 3 second connection timeout
+        timeout.tv_usec = 0;
+        
+        result = select(sock + 1, NULL, &write_fds, NULL, &timeout);
+        if (result <= 0) {
+            close(sock);
+            return -1;
+        }
+        
+        // Check if connection was successful
+        int error;
+        socklen_t len = sizeof(error);
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
+            close(sock);
+            return -1;
+        }
+        
+        // Set back to blocking mode
+        fcntl(sock, F_SETFL, flags);
         
         return sock;
     }
@@ -306,8 +341,39 @@ public:
     }
     
     static std::vector<uint8_t> recv_message(int sockfd, uint8_t& id) {
+        // Helper function to read exact number of bytes with timeout
+        auto read_exact = [&](void* buf, size_t count) -> bool {
+            size_t total_read = 0;
+            char* buffer = static_cast<char*>(buf);
+            
+            while (total_read < count) {
+                fd_set read_fds;
+                FD_ZERO(&read_fds);
+                FD_SET(sockfd, &read_fds);
+                
+                struct timeval timeout;
+                timeout.tv_sec = 5;  // 5 seconds timeout
+                timeout.tv_usec = 0;
+                
+                int result = select(sockfd + 1, &read_fds, NULL, NULL, &timeout);
+                if (result <= 0) {
+                    return false; // Timeout or error
+                }
+                
+                ssize_t bytes_read = read(sockfd, buffer + total_read, count - total_read);
+                if (bytes_read <= 0) {
+                    return false; // Connection closed or error
+                }
+                total_read += bytes_read;
+            }
+            return true;
+        };
+        
+        // Read message length
         uint8_t len_buf[4];
-        if (read(sockfd, len_buf, 4) != 4) throw std::runtime_error("Failed to read message length");
+        if (!read_exact(len_buf, 4)) {
+            throw std::runtime_error("Failed to read message length");
+        }
         uint32_t length = ntohl(*(uint32_t*)len_buf);
         
         if (length == 0) {
@@ -315,10 +381,21 @@ public:
             return {};
         }
         
-        if (read(sockfd, &id, 1) != 1) throw std::runtime_error("Failed to read message ID");
+        if (length > 1000000) { // Sanity check
+            throw std::runtime_error("Invalid message length: " + std::to_string(length));
+        }
+        
+        // Read message ID
+        if (!read_exact(&id, 1)) {
+            throw std::runtime_error("Failed to read message ID");
+        }
+        
+        // Read payload
         std::vector<uint8_t> payload(length - 1);
-        if (read(sockfd, payload.data(), payload.size()) != (int)payload.size()) {
-            throw std::runtime_error("Incomplete payload");
+        if (payload.size() > 0) {
+            if (!read_exact(payload.data(), payload.size())) {
+                throw std::runtime_error("Failed to read complete payload");
+            }
         }
         return payload;
     }
@@ -338,7 +415,7 @@ public:
         return bitfield;
     }
     
-    static void download_piece(const TorrentInfo& torrent_info, const Peer& peer, int piece_index) {
+    static void download_piece(const TorrentInfo& torrent_info, const Peer& peer, int piece_index, const std::string& output_file = "") {
         constexpr int block_size = BLOCK_SIZE;
         
         std::string peer_id = generate_peer_id();
@@ -353,22 +430,84 @@ public:
             throw std::runtime_error("Handshake failed");
         }
         
-        // Wait for bitfield and unchoke
+        // Calculate actual piece length (last piece might be smaller)
+        int64_t total_length = torrent_info.length;
+        int actual_piece_length = torrent_info.piece_length;
+        
+        // Check if this is the last piece
+        int total_pieces = (total_length + torrent_info.piece_length - 1) / torrent_info.piece_length;
+        if (piece_index == total_pieces - 1) {
+            // Last piece might be smaller
+            actual_piece_length = total_length % torrent_info.piece_length;
+            if (actual_piece_length == 0) {
+                actual_piece_length = torrent_info.piece_length;
+            }
+        }
+        
+        // Send interested immediately
+        send_interested(sock);
+        
+        // Fast initial message processing
         bool peer_choking = true;
         std::vector<bool> bitfield;
+        bool has_bitfield = false;
         
-        while (true) {
-            uint8_t msg_id;
-            std::vector<uint8_t> payload = recv_message(sock, msg_id);
-            
-            if (msg_id == 1) {
-                peer_choking = false;
-            } else if (msg_id == 5) {
-                bitfield = parse_bitfield(std::string(payload.begin(), payload.end()), 
-                                        torrent_info.piece_hashes.size());
+        // Quick setup with timeout
+        auto start_time = std::chrono::steady_clock::now();
+        auto timeout_duration = std::chrono::seconds(5);
+        
+        while (peer_choking || !has_bitfield) {
+            auto current_time = std::chrono::steady_clock::now();
+            if (current_time - start_time > timeout_duration) {
+                if (!has_bitfield) {
+                    bitfield.assign(torrent_info.piece_hashes.size(), true);
+                    has_bitfield = true;
+                }
+                break;
             }
             
-            if (!peer_choking && !bitfield.empty()) break;
+            try {
+                uint8_t msg_id;
+                std::vector<uint8_t> payload = recv_message(sock, msg_id);
+                
+                if (msg_id == 1) { // UNCHOKE
+                    peer_choking = false;
+                } else if (msg_id == 5) { // BITFIELD
+                    bitfield = parse_bitfield(std::string(payload.begin(), payload.end()), 
+                                            torrent_info.piece_hashes.size());
+                    has_bitfield = true;
+                    
+                    if (piece_index >= (int)bitfield.size() || !bitfield[piece_index]) {
+                        close(sock);
+                        throw std::runtime_error("Peer does not have the requested piece");
+                    }
+                } else if (msg_id == 4) { // HAVE
+                    if (!has_bitfield) {
+                        bitfield.assign(torrent_info.piece_hashes.size(), false);
+                        has_bitfield = true;
+                    }
+                    if (payload.size() >= 4) {
+                        uint32_t piece_idx = ntohl(*(uint32_t*)payload.data());
+                        if (piece_idx < bitfield.size()) {
+                            bitfield[piece_idx] = true;
+                        }
+                    }
+                } else if (msg_id == 0xFF) {
+                    continue; // Keep-alive
+                }
+                
+                if (!peer_choking && has_bitfield && 
+                    piece_index < (int)bitfield.size() && bitfield[piece_index]) {
+                    break;
+                }
+                
+            } catch (const std::exception& e) {
+                if (!has_bitfield) {
+                    bitfield.assign(torrent_info.piece_hashes.size(), true);
+                    has_bitfield = true;
+                }
+                break;
+            }
         }
         
         if (peer_choking) {
@@ -376,31 +515,46 @@ public:
             throw std::runtime_error("Peer is still choking");
         }
         
-        if (!bitfield[piece_index]) {
+        if (piece_index >= (int)bitfield.size() || !bitfield[piece_index]) {
             close(sock);
             throw std::runtime_error("Peer does not have the requested piece");
         }
         
-        send_interested(sock);
-        
-        // Download piece
-        std::vector<uint8_t> piece_data(torrent_info.piece_length, 0);
+        // Download piece data
+        std::vector<uint8_t> piece_data(actual_piece_length, 0);
         int offset = 0;
         
-        while (offset < torrent_info.piece_length) {
-            int req_len = std::min(block_size, torrent_info.piece_length - offset);
+        while (offset < actual_piece_length) {
+            int req_len = std::min(block_size, actual_piece_length - offset);
             send_request(sock, piece_index, offset, req_len);
             
-            while (true) {
+            bool received_piece = false;
+            
+            try {
                 uint8_t msg_id;
                 std::vector<uint8_t> payload = recv_message(sock, msg_id);
-                if (msg_id == 7 && payload.size() >= 8) {
+                
+                if (msg_id == 7 && payload.size() >= 8) { // PIECE message
                     int idx = ntohl(*(uint32_t*)&payload[0]);
                     int begin = ntohl(*(uint32_t*)&payload[4]);
-                    std::copy(payload.begin() + 8, payload.end(), piece_data.begin() + begin);
-                    offset += payload.size() - 8;
-                    break;
+                    
+                    if (idx == piece_index && begin == offset) {
+                        int data_len = payload.size() - 8;
+                        if (begin + data_len <= actual_piece_length) {
+                            std::copy(payload.begin() + 8, payload.end(), piece_data.begin() + begin);
+                            offset += data_len;
+                            received_piece = true;
+                        }
+                    }
                 }
+            } catch (const std::exception& e) {
+                close(sock);
+                throw std::runtime_error("Failed to receive piece block: " + std::string(e.what()));
+            }
+            
+            if (!received_piece) {
+                close(sock);
+                throw std::runtime_error("Did not receive expected piece block");
             }
         }
         
@@ -414,7 +568,12 @@ public:
         }
         
         // Save piece
-        std::ofstream out("piece_" + std::to_string(piece_index) + ".bin", std::ios::binary);
+        std::string filename = output_file.empty() ? "piece_" + std::to_string(piece_index) + ".bin" : output_file;
+        std::ofstream out(filename, std::ios::binary);
+        if (!out) {
+            close(sock);
+            throw std::runtime_error("Failed to create output file: " + filename);
+        }
         out.write(reinterpret_cast<const char*>(piece_data.data()), piece_data.size());
         out.close();
         
@@ -623,8 +782,8 @@ void handle_download_piece(const std::vector<std::string>& args) {
             return;
         }
         
-        // Try to download from the first available peer
-        BitTorrentClient::download_piece(info, peers[0], piece_index);
+        // Try only the first peer to avoid timeout
+        BitTorrentClient::download_piece(info, peers[0], piece_index, output_file);
         
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

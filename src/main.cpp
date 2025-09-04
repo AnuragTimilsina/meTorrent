@@ -21,6 +21,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <chrono>
+#include <thread>
+#include <mutex>
+#include <queue>
+#include <condition_variable>
+#include <atomic>
+#include <algorithm>
 
 #include "lib/nlohmann/json.hpp"
 
@@ -64,6 +70,130 @@ struct TorrentInfo {
             }
             std::cout << oss.str() << std::endl;
         }
+    }
+    
+    int get_piece_count() const {
+        return static_cast<int>(piece_hashes.size());
+    }
+    
+    int get_piece_size(int piece_index) const {
+        int total_pieces = get_piece_count();
+        if (piece_index < total_pieces - 1) {
+            return piece_length;
+        } else {
+            // Last piece might be smaller
+            int last_piece_size = length % piece_length;
+            return last_piece_size == 0 ? piece_length : last_piece_size;
+        }
+    }
+};
+
+// Work queue for multi-threaded downloads
+class WorkQueue {
+private:
+    std::queue<int> pieces;
+    mutable std::mutex mtx;
+    std::condition_variable cv;
+    bool finished = false;
+    
+public:
+    void add_piece(int piece_index) {
+        std::lock_guard<std::mutex> lock(mtx);
+        pieces.push(piece_index);
+        cv.notify_one();
+    }
+    
+    bool get_piece(int& piece_index) {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [this] { return !pieces.empty() || finished; });
+        
+        if (pieces.empty()) {
+            return false; // No more work
+        }
+        
+        piece_index = pieces.front();
+        pieces.pop();
+        return true;
+    }
+    
+    void mark_finished() {
+        std::lock_guard<std::mutex> lock(mtx);
+        finished = true;
+        cv.notify_all();
+    }
+    
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mtx);
+        return pieces.size();
+    }
+};
+
+class DownloadProgress {
+private:
+    std::vector<bool> completed_pieces;
+    std::vector<std::vector<uint8_t>> piece_data;
+    mutable std::mutex mtx;
+    std::atomic<int> completed_count{0};
+    int total_pieces;
+    
+public:
+    DownloadProgress(int num_pieces, const TorrentInfo& torrent) 
+        : completed_pieces(num_pieces, false), piece_data(num_pieces), total_pieces(num_pieces) {
+        
+        // Pre-allocate piece data vectors
+        for (int i = 0; i < num_pieces; ++i) {
+            piece_data[i].resize(torrent.get_piece_size(i));
+        }
+    }
+    
+    void mark_piece_complete(int piece_index, const std::vector<uint8_t>& data) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!completed_pieces[piece_index]) {
+            completed_pieces[piece_index] = true;
+            piece_data[piece_index] = data;
+            completed_count++;
+            
+            // Reduced logging for speed
+            if (completed_count % 3 == 0 || completed_count == total_pieces) {
+                std::cout << "Downloaded piece " << piece_index << " (" 
+                          << completed_count << "/" << total_pieces << ")" << std::endl;
+            }
+        }
+    }
+    
+    bool is_piece_complete(int piece_index) const {
+        std::lock_guard<std::mutex> lock(mtx);
+        return completed_pieces[piece_index];
+    }
+    
+    bool is_download_complete() const {
+        return completed_count == total_pieces;
+    }
+    
+    void write_to_file(const std::string& filename) {
+        std::lock_guard<std::mutex> lock(mtx);
+        std::ofstream file(filename, std::ios::binary);
+        if (!file) {
+            throw std::runtime_error("Failed to create output file: " + filename);
+        }
+        
+        for (int i = 0; i < total_pieces; ++i) {
+            if (!completed_pieces[i]) {
+                throw std::runtime_error("Cannot write file: piece " + std::to_string(i) + " not downloaded");
+            }
+            file.write(reinterpret_cast<const char*>(piece_data[i].data()), piece_data[i].size());
+        }
+        
+        file.close();
+        std::cout << "File assembled and saved to: " << filename << std::endl;
+    }
+    
+    int get_completed_count() const {
+        return completed_count;
+    }
+    
+    int get_total_count() const {
+        return total_pieces;
     }
 };
 
@@ -352,7 +482,7 @@ public:
                 FD_SET(sockfd, &read_fds);
                 
                 struct timeval timeout;
-                timeout.tv_sec = 5;  // 5 seconds timeout
+                timeout.tv_sec = 2;  // Very aggressive timeout for speed
                 timeout.tv_usec = 0;
                 
                 int result = select(sockfd + 1, &read_fds, NULL, NULL, &timeout);
@@ -415,6 +545,145 @@ public:
         return bitfield;
     }
     
+    static bool download_piece_from_peer(const TorrentInfo& torrent_info, const Peer& peer, 
+                                       int piece_index, std::vector<uint8_t>& piece_data) {
+        constexpr int block_size = BLOCK_SIZE;
+        
+        std::string peer_id = generate_peer_id();
+        
+        int sock = connect_to_peer(peer);
+        if (sock < 0) {
+            return false;
+        }
+        
+        if (!perform_handshake(sock, torrent_info.info_hash_raw, peer_id)) {
+            close(sock);
+            return false;
+        }
+        
+        int actual_piece_length = torrent_info.get_piece_size(piece_index);
+        piece_data.resize(actual_piece_length);
+        
+        // Send interested immediately
+        send_interested(sock);
+        
+        // Setup phase
+        bool peer_choking = true;
+        std::vector<bool> bitfield;
+        bool has_bitfield = false;
+        
+        auto start_time = std::chrono::steady_clock::now();
+        auto timeout_duration = std::chrono::seconds(2); // Much faster setup
+        
+        while (peer_choking || !has_bitfield) {
+            auto current_time = std::chrono::steady_clock::now();
+            if (current_time - start_time > timeout_duration) {
+                if (!has_bitfield) {
+                    bitfield.assign(torrent_info.piece_hashes.size(), true);
+                    has_bitfield = true;
+                }
+                break;
+            }
+            
+            try {
+                uint8_t msg_id;
+                std::vector<uint8_t> payload = recv_message(sock, msg_id);
+                
+                if (msg_id == 1) { // UNCHOKE
+                    peer_choking = false;
+                } else if (msg_id == 5) { // BITFIELD
+                    bitfield = parse_bitfield(std::string(payload.begin(), payload.end()), 
+                                            torrent_info.piece_hashes.size());
+                    has_bitfield = true;
+                    
+                    if (piece_index >= (int)bitfield.size() || !bitfield[piece_index]) {
+                        close(sock);
+                        return false;
+                    }
+                } else if (msg_id == 4) { // HAVE
+                    if (!has_bitfield) {
+                        bitfield.assign(torrent_info.piece_hashes.size(), false);
+                        has_bitfield = true;
+                    }
+                    if (payload.size() >= 4) {
+                        uint32_t piece_idx = ntohl(*(uint32_t*)payload.data());
+                        if (piece_idx < bitfield.size()) {
+                            bitfield[piece_idx] = true;
+                        }
+                    }
+                } else if (msg_id == 0xFF) {
+                    continue; // Keep-alive
+                }
+                
+            } catch (const std::exception& e) {
+                if (!has_bitfield) {
+                    bitfield.assign(torrent_info.piece_hashes.size(), true);
+                    has_bitfield = true;
+                }
+                break;
+            }
+        }
+        
+        if (peer_choking) {
+            close(sock);
+            return false;
+        }
+        
+        if (piece_index >= (int)bitfield.size() || !bitfield[piece_index]) {
+            close(sock);
+            return false;
+        }
+        
+        // Download piece data
+        int offset = 0;
+        
+        while (offset < actual_piece_length) {
+            int req_len = std::min(block_size, actual_piece_length - offset);
+            send_request(sock, piece_index, offset, req_len);
+            
+            bool received_piece = false;
+            
+            try {
+                uint8_t msg_id;
+                std::vector<uint8_t> payload = recv_message(sock, msg_id);
+                
+                if (msg_id == 7 && payload.size() >= 8) { // PIECE message
+                    int idx = ntohl(*(uint32_t*)&payload[0]);
+                    int begin = ntohl(*(uint32_t*)&payload[4]);
+                    
+                    if (idx == piece_index && begin == offset) {
+                        int data_len = payload.size() - 8;
+                        if (begin + data_len <= actual_piece_length) {
+                            std::copy(payload.begin() + 8, payload.end(), piece_data.begin() + begin);
+                            offset += data_len;
+                            received_piece = true;
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                close(sock);
+                return false;
+            }
+            
+            if (!received_piece) {
+                close(sock);
+                return false;
+            }
+        }
+        
+        // Verify hash
+        unsigned char actual_hash[SHA_DIGEST_LENGTH];
+        SHA1(piece_data.data(), piece_data.size(), actual_hash);
+        
+        if (memcmp(actual_hash, torrent_info.piece_hashes[piece_index].data(), SHA_DIGEST_LENGTH) != 0) {
+            close(sock);
+            return false;
+        }
+        
+        close(sock);
+        return true;
+    }
+    
     static void download_piece(const TorrentInfo& torrent_info, const Peer& peer, int piece_index, const std::string& output_file = "") {
         constexpr int block_size = BLOCK_SIZE;
         
@@ -430,19 +699,7 @@ public:
             throw std::runtime_error("Handshake failed");
         }
         
-        // Calculate actual piece length (last piece might be smaller)
-        int64_t total_length = torrent_info.length;
-        int actual_piece_length = torrent_info.piece_length;
-        
-        // Check if this is the last piece
-        int total_pieces = (total_length + torrent_info.piece_length - 1) / torrent_info.piece_length;
-        if (piece_index == total_pieces - 1) {
-            // Last piece might be smaller
-            actual_piece_length = total_length % torrent_info.piece_length;
-            if (actual_piece_length == 0) {
-                actual_piece_length = torrent_info.piece_length;
-            }
-        }
+        int actual_piece_length = torrent_info.get_piece_size(piece_index);
         
         // Send interested immediately
         send_interested(sock);
@@ -579,6 +836,155 @@ public:
         
         std::cout << "Piece " << piece_index << " downloaded and verified." << std::endl;
         close(sock);
+    }
+    
+    // === MULTI-THREADED DOWNLOAD WORKER ===
+    
+    static void download_worker(const TorrentInfo& torrent_info, const std::vector<Peer>& peers,
+                              WorkQueue& work_queue, DownloadProgress& progress) {
+        while (true) {
+            int piece_index;
+            if (!work_queue.get_piece(piece_index)) {
+                break; // No more work
+            }
+            
+            // Skip if piece already downloaded
+            if (progress.is_piece_complete(piece_index)) {
+                continue;
+            }
+            
+            bool downloaded = false;
+            
+            // Try downloading from each peer until successful
+            for (const auto& peer : peers) {
+                try {
+                    std::vector<uint8_t> piece_data;
+                    if (download_piece_from_peer(torrent_info, peer, piece_index, piece_data)) {
+                        progress.mark_piece_complete(piece_index, piece_data);
+                        downloaded = true;
+                        break;
+                    }
+                } catch (const std::exception& e) {
+                    // Try next peer
+                    continue;
+                }
+            }
+            
+            // If download failed, put piece back in queue (but don't sleep - keep trying)
+            if (!downloaded) {
+                work_queue.add_piece(piece_index);
+            }
+        }
+    }
+    
+    // === SINGLE-PEER DOWNLOAD ===
+    
+    static void download_file_single_peer(const TorrentInfo& torrent_info, const std::string& output_file) {
+        std::vector<Peer> peers = get_peers(torrent_info);
+        
+        if (peers.empty()) {
+            throw std::runtime_error("No peers available from tracker");
+        }
+        
+        std::cout << "Starting single-peer download with " << peers.size() << " available peers" << std::endl;
+        
+        int total_pieces = torrent_info.get_piece_count();
+        DownloadProgress progress(total_pieces, torrent_info);
+        
+        // Try each peer until we find one that works
+        bool found_working_peer = false;
+        
+        for (const auto& peer : peers) {
+            std::cout << "Trying peer: " << peer.to_string() << std::endl;
+            
+            try {
+                // Download all pieces from this peer
+                for (int piece_index = 0; piece_index < total_pieces; ++piece_index) {
+                    if (progress.is_piece_complete(piece_index)) {
+                        continue;
+                    }
+                    
+                    std::vector<uint8_t> piece_data;
+                    if (download_piece_from_peer(torrent_info, peer, piece_index, piece_data)) {
+                        progress.mark_piece_complete(piece_index, piece_data);
+                    } else {
+                        throw std::runtime_error("Failed to download piece " + std::to_string(piece_index));
+                    }
+                }
+                
+                found_working_peer = true;
+                break;
+                
+            } catch (const std::exception& e) {
+                std::cerr << "Peer " << peer.to_string() << " failed: " << e.what() << std::endl;
+                std::cerr << "Trying next peer..." << std::endl;
+                continue;
+            }
+        }
+        
+        if (!found_working_peer) {
+            throw std::runtime_error("Failed to download from any available peer");
+        }
+        
+        if (progress.is_download_complete()) {
+            progress.write_to_file(output_file);
+            std::cout << "Download completed successfully!" << std::endl;
+        } else {
+            throw std::runtime_error("Download incomplete");
+        }
+    }
+    
+    // === MULTI-PEER DOWNLOAD ===
+    
+    static void download_file_multi_peer(const TorrentInfo& torrent_info, const std::string& output_file, int num_workers = 4) {
+        std::vector<Peer> peers = get_peers(torrent_info);
+        
+        if (peers.empty()) {
+            throw std::runtime_error("No peers available from tracker");
+        }
+        
+        std::cout << "Starting multi-peer download with " << peers.size() << " peers and " 
+                  << num_workers << " workers" << std::endl;
+        
+        int total_pieces = torrent_info.get_piece_count();
+        WorkQueue work_queue;
+        DownloadProgress progress(total_pieces, torrent_info);
+        
+        // Add all pieces to work queue
+        for (int i = 0; i < total_pieces; ++i) {
+            work_queue.add_piece(i);
+        }
+        
+        // Start worker threads
+        std::vector<std::thread> workers;
+        for (int i = 0; i < num_workers; ++i) {
+            workers.emplace_back(download_worker, std::cref(torrent_info), std::cref(peers),
+                               std::ref(work_queue), std::ref(progress));
+        }
+        
+        // Monitor progress (minimal to avoid overhead)
+        while (!progress.is_download_complete()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Very fast checking
+            
+            // No timeout - let it complete naturally
+            // No frequent progress printing to reduce overhead
+        }
+        
+        // Signal workers to stop and wait for them
+        work_queue.mark_finished();
+        for (auto& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        
+        if (progress.is_download_complete()) {
+            progress.write_to_file(output_file);
+            std::cout << "Multi-peer download completed successfully!" << std::endl;
+        } else {
+            throw std::runtime_error("Download incomplete - " + std::to_string(progress.get_completed_count()) 
+                                   + "/" + std::to_string(progress.get_total_count()) + " pieces downloaded");
+        }
     }
     
     // === BENCODE FUNCTIONS ===
@@ -790,6 +1196,52 @@ void handle_download_piece(const std::vector<std::string>& args) {
     }
 }
 
+void handle_download(const std::vector<std::string>& args) {
+    if (args.size() < 3 || args[0] != "-o") {
+        std::cerr << "Usage: download -o <output_file> <file.torrent> [--single-peer]" << std::endl;
+        return;
+    }
+    
+    std::string output_file = args[1];
+    std::string torrent_file = args[2];
+    bool single_peer = false;
+    
+    // Check for single-peer flag (multi-peer is now default)
+    if (args.size() > 3 && args[3] == "--single-peer") {
+        single_peer = true;
+    }
+    
+    try {
+        TorrentInfo info = BitTorrentClient::parse_torrent(torrent_file);
+        
+        std::cout << "Starting download of " << info.length << " bytes in " 
+                  << info.get_piece_count() << " pieces" << std::endl;
+        
+        auto start_time = std::chrono::steady_clock::now();
+        
+        if (single_peer) {
+            // Use single-peer download
+            std::cout << "Using single-peer mode" << std::endl;
+            BitTorrentClient::download_file_single_peer(info, output_file);
+        } else {
+            // Use multi-peer download (default for speed)
+            int num_workers = std::min(6, static_cast<int>(std::thread::hardware_concurrency()));
+            std::cout << "Using multi-peer mode with " << num_workers << " workers" << std::endl;
+            BitTorrentClient::download_file_multi_peer(info, output_file, num_workers);
+        }
+        
+        auto end_time = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
+        
+        double speed_mbps = (info.length / (1024.0 * 1024.0)) / std::max(1, static_cast<int>(duration.count()));
+        std::cout << "Download completed in " << duration.count() << " seconds" << std::endl;
+        std::cout << "Average speed: " << std::fixed << std::setprecision(2) << speed_mbps << " MB/s" << std::endl;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Download failed: " << e.what() << std::endl;
+    }
+}
+
 // === MAIN ===
 
 int main(int argc, char* argv[]) {
@@ -798,7 +1250,7 @@ int main(int argc, char* argv[]) {
     
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <command> <args>" << std::endl;
-        std::cerr << "Commands: decode, info, peers, handshake, download_piece" << std::endl;
+        std::cerr << "Commands: decode, info, peers, handshake, download_piece, download" << std::endl;
         return 1;
     }
     
@@ -818,9 +1270,11 @@ int main(int argc, char* argv[]) {
         handle_handshake(args);
     } else if (command == "download_piece") {
         handle_download_piece(args);
+    } else if (command == "download") {
+        handle_download(args);
     } else {
         std::cerr << "Unknown command: " << command << std::endl;
-        std::cerr << "Available commands: decode, info, peers, handshake, download_piece" << std::endl;
+        std::cerr << "Available commands: decode, info, peers, handshake, download_piece, download" << std::endl;
         return 1;
     }
     

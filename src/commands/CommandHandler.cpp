@@ -2,6 +2,7 @@
 #include "../core/BitTorrentClient.hpp"
 #include "../core/TorrentInfo.hpp"
 #include "../core/Peer.hpp"
+#include "../core/MagnetInfo.hpp"
 #include "../network/TrackerClient.hpp"
 #include "../network/PeerConnection.hpp"
 #include "../download/DownloadProgress.hpp"
@@ -37,6 +38,8 @@ int CommandHandler::execute(const std::string& command, const std::vector<std::s
         handle_download_piece(args);
     } else if (command == "download") {
         handle_download(args);
+    } else if (command == "magnet_parse") {
+        handle_magnet_parse(args);
     } else {
         std::cerr << "Unknown command: " << command << std::endl;
         return 1;
@@ -182,5 +185,19 @@ void CommandHandler::handle_download(const std::vector<std::string>& args) {
 
     } catch (const std::exception& e) {
         std::cerr << "Download failed: " << e.what() << std::endl;
+    }
+}
+
+void CommandHandler::handle_magnet_parse(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        std::cerr << "Usage: magnet_parse <magnet_link>" << std::endl;
+        return;
+    }
+
+    try {
+        MagnetInfo magnet_info = BitTorrentClient::parse_magnet_link(args[0]);
+        magnet_info.print_info();
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;        
     }
 }

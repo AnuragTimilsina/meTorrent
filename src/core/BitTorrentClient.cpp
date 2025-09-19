@@ -18,6 +18,7 @@
 #include <iostream>
 #include <iomanip>
 
+// parse torrent file to extract metadata
 TorrentInfo BitTorrentClient::parse_torrent(const std::string& filename) {
     std::string buffer = read_file(filename);
     json torrent = BencodeParser::decode_bencoded_value(buffer);
@@ -47,26 +48,6 @@ TorrentInfo BitTorrentClient::parse_torrent(const std::string& filename) {
     return info;
 }
 
-MagnetInfo BitTorrentClient::parse_magnet_link(const std::string& magnet_url) {
-    MagnetInfo info;
-    
-    // TODO: Implement magnet link parsing
-    // Steps:
-    // 1. Validate URL starts with "magnet:?"
-    // 2. Extract query string after "magnet:?"
-    // 3. Split query parameters by '&'
-    // 4. For each parameter, split by '=' to get key-value pairs
-    // 5. Process these parameters:
-    //    - xt: extract info hash (remove "urn:btih:" prefix)
-    //    - tr: extract and URL decode tracker URL
-    //    - dn: extract and URL decode display name (optional)
-    // 6. Convert hex info hash to raw bytes
-    
-    // Placeholder implementation - you need to implement this
-    throw std::runtime_error("Magnet link parsing not implemented yet");
-    
-    return info;
-}
 
 void BitTorrentClient::download_file_single_peer(const TorrentInfo& torrent_info, const std::string& output_file) {
     std::vector<Peer> peers = TrackerClient::get_peers(torrent_info);
@@ -209,4 +190,41 @@ std::string BitTorrentClient::read_file(const std::string& filename) {
     std::stringstream buffer;
     buffer << file.rdbuf();
     return buffer.str();
+}
+
+MagnetInfo BitTorrentClient::parse_magnet_link(const std::string& magnet_url) {
+    MagnetInfo info;
+
+    if (magnet_url.substr(0, 8) != "magnet:?") {
+        throw std::invalid_argument("Invalid magnet link format");
+    }
+
+    std::string query = magnet_url.substr(8);
+    std::istringstream query_stream(query);
+    std::string token; 
+
+    while (std::getline(query_stream, token, '&')) {
+        size_t eq_pos = token.find('=');
+        if (eq_pos == std::string::npos) continue;
+
+        std::string key = token.substr(0, eq_pos);
+        std::string value = token.substr(eq_pos + 1);
+
+        if (key == "xt" && value.substr(0, 9) == "urn:btih:") {
+            info.info_hash_hex = value.substr(9);
+            if (info.info_hash_hex.size() != 40 && info.info_hash_hex.size() != 32) {
+                throw std::invalid_argument("Invalid info hash length in magnet link");
+            }
+            // Convert hex to raw bytes
+            info.info_hash_raw.resize(info.info_hash_hex.size() / 2);
+            for (size_t i = 0; i < info.info_hash_raw.size(); ++i) {
+                info.info_hash_raw[i] = static_cast<char>(std::stoi(info.info_hash_hex.substr(i * 2, 2), nullptr, 16));
+            }
+        } else if (key == "tr") {
+            info.tracker_url = NetworkUtils::url_decode(value);
+        } else if (key == "dn") {
+            info.display_name = NetworkUtils::url_decode(value);
+        }
+    }
+    return info; 
 }

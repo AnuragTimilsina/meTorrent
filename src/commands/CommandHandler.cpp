@@ -46,6 +46,12 @@ int CommandHandler::execute(const std::string& command, const std::vector<std::s
     } else if (command == "magnet_info") {
         handle_magnet_info(args);
     }
+    else if (command == "magnet_download_piece"){
+        handle_magnet_download_piece(args);
+    }
+    else if (command == "magnet_download"){
+        handle_magnet_download(args);
+    }
     
     else {
         std::cerr << "Unknown command: " << command << std::endl;
@@ -482,7 +488,404 @@ void CommandHandler::handle_magnet_info(const std::vector<std::string>& args) {
 }
 
 
+void CommandHandler::handle_magnet_download_piece(const std::vector<std::string>& args) {
+    if (args.size() < 4 || args[0] != "-o") {
+        std::cerr << "Usage: magnet_download_piece -o <output_file> <magnet_link> <piece_index>" << std::endl;
+        return;
+    }
 
+    std::string output_file = args[1];
+    std::string magnet_link = args[2];
+    int piece_index = std::stoi(args[3]);
+
+    try {
+        // Step 1: Parse the magnet link
+        MagnetInfo magnet_info = BitTorrentClient::parse_magnet_link(magnet_link);
+
+        // Step 2: Get peers from tracker
+        auto peers = TrackerClient::get_peers(magnet_info);
+        if (peers.empty()) {
+            std::cerr << "No peers received from tracker." << std::endl;
+            return;
+        }
+
+        // Step 3: Try peers until we successfully download the piece
+        bool success = false;
+        TorrentInfo torrent_info;
+
+        for (const auto& peer : peers) {
+            try {
+                std::string peer_id = BitTorrentClient::generate_peer_id();
+
+                // Step 4: Connect and perform base handshake
+                int sock = PeerConnection::connect_to_peer(peer);
+                if (sock < 0) {
+                    continue;
+                }
+
+                std::array<char, 68> handshake_response{};
+                if (!PeerConnection::perform_handshake(sock, magnet_info.info_hash_raw, peer_id, handshake_response)) {
+                    close(sock);
+                    continue;
+                }
+
+                // Try to read first peer message (bitfield, etc.)
+                try {
+                    uint8_t msg_id = 0;
+                    PeerConnection::recv_message(sock, msg_id);
+                } catch (...) {
+                    // Not critical, continue
+                }
+
+                // Step 5: Check for extension protocol support
+                bool peer_supports_extensions = false;
+                if (handshake_response.size() >= 68) {
+                    unsigned char reserved5 = static_cast<unsigned char>(handshake_response[25]);
+                    peer_supports_extensions = (reserved5 & 0x10) != 0;
+                }
+
+                if (!peer_supports_extensions) {
+                    close(sock);
+                    continue;
+                }
+
+                // Step 6: Send extension handshake
+                json ext_dict;
+                ext_dict["m"] = { {"ut_metadata", 1} };
+                std::string bencoded = BencodeParser::json_to_bencode(ext_dict);
+
+                std::vector<uint8_t> ext_payload;
+                ext_payload.push_back(0); // extended message id = 0 (handshake)
+                ext_payload.insert(ext_payload.end(), bencoded.begin(), bencoded.end());
+                PeerConnection::send_message(sock, 20, ext_payload);
+
+                // Step 7: Receive extension handshake
+                uint8_t peer_ut_metadata_id = 0;
+                {
+                    uint8_t resp_msg_id = 0;
+                    auto resp_payload = PeerConnection::recv_message(sock, resp_msg_id);
+
+                    if (resp_msg_id == 20 && !resp_payload.empty() && resp_payload[0] == 0) {
+                        std::string benc_str(reinterpret_cast<char*>(resp_payload.data() + 1),
+                                             resp_payload.size() - 1);
+                        json peer_ext_dict = BencodeParser::decode_bencoded_value(benc_str);
+
+                        if (peer_ext_dict.contains("m") &&
+                            peer_ext_dict["m"].is_object() &&
+                            peer_ext_dict["m"].contains("ut_metadata")) {
+                            peer_ut_metadata_id = peer_ext_dict["m"]["ut_metadata"].get<int>();
+                        } else {
+                            close(sock);
+                            continue;
+                        }
+                    } else {
+                        close(sock);
+                        continue;
+                    }
+                }
+
+                // Step 8: Request metadata piece 0
+                json request_dict;
+                request_dict["msg_type"] = 0;
+                request_dict["piece"] = 0;
+
+                std::string bencoded_request = BencodeParser::json_to_bencode(request_dict);
+                std::vector<uint8_t> request_payload;
+                request_payload.push_back(peer_ut_metadata_id);
+                request_payload.insert(request_payload.end(),
+                                       bencoded_request.begin(),
+                                       bencoded_request.end());
+
+                PeerConnection::send_message(sock, 20, request_payload);
+
+                // Step 9: Receive metadata response
+                uint8_t metadata_msg_id = 0;
+                auto metadata_payload = PeerConnection::recv_message(sock, metadata_msg_id);
+
+                if (metadata_msg_id != 20 || metadata_payload.empty()) {
+                    close(sock);
+                    continue;
+                }
+
+                std::string full_payload(reinterpret_cast<char*>(metadata_payload.data() + 1),
+                                         metadata_payload.size() - 1);
+
+                // Split dictionary and metadata
+                size_t pos = 0;
+                json metadata_dict = BencodeParser::decode_bencoded_value(full_payload, pos);
+
+                if (!metadata_dict.contains("msg_type") || metadata_dict["msg_type"].get<int>() != 1) {
+                    close(sock);
+                    continue;
+                }
+
+                std::string metadata_content = full_payload.substr(pos);
+
+                // Parse metadata dictionary (the "info" dict)
+                json info_dict = BencodeParser::decode_bencoded_value(metadata_content);
+
+                // Validate SHA1(info) == info_hash
+                std::string reencoded_info = BencodeParser::json_to_bencode(info_dict);
+                std::string computed_hash = CryptoUtils::sha1_to_hex(reencoded_info);
+
+                if (computed_hash != magnet_info.info_hash_hex) {
+                    close(sock);
+                    continue;
+                }
+
+                // Step 10: Build TorrentInfo from the metadata
+                torrent_info.tracker_url = magnet_info.tracker_url;
+                torrent_info.length = info_dict["length"].get<int64_t>();
+                torrent_info.piece_length = info_dict["piece length"].get<int>();
+                torrent_info.info_hash_hex = magnet_info.info_hash_hex;
+                torrent_info.info_hash_raw = magnet_info.info_hash_raw;
+                torrent_info.info_dict = info_dict;
+
+                // Parse piece hashes
+                std::string pieces_raw = info_dict["pieces"].get<std::string>();
+                for (size_t i = 0; i < pieces_raw.size(); i += 20) {
+                    std::array<uint8_t, 20> piece_hash;
+                    memcpy(piece_hash.data(), pieces_raw.data() + i, 20);
+                    torrent_info.piece_hashes.push_back(piece_hash);
+                }
+
+                close(sock);
+
+                // Step 11: Download the piece using existing logic
+                std::vector<uint8_t> piece_data;
+                if (PieceDownloader::download_piece_from_peer(torrent_info, peer, piece_index, piece_data)) {
+                    // Save piece to file
+                    std::ofstream out(output_file, std::ios::binary);
+                    if (!out) {
+                        throw std::runtime_error("Failed to create output file: " + output_file);
+                    }
+                    out.write(reinterpret_cast<const char*>(piece_data.data()), piece_data.size());
+                    out.close();
+
+                    std::cout << "Piece " << piece_index << " downloaded to " << output_file << std::endl;
+                    success = true;
+                    break;
+                }
+
+            } catch (const std::exception& e) {
+                // Try next peer
+                continue;
+            }
+        }
+
+        if (!success) {
+            std::cerr << "Failed to download piece from any available peer." << std::endl;
+        }
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
+}
+
+
+void CommandHandler::handle_magnet_download(const std::vector<std::string>& args) {
+    if (args.size() < 3 || args[0] != "-o") {
+        std::cerr << "Usage: magnet_download -o <output_file> <magnet_link>" << std::endl;
+        return;
+    }
+
+    std::string output_file = args[1];
+    std::string magnet_link = args[2];
+
+    try {
+        // Step 1: Parse the magnet link
+        MagnetInfo magnet_info = BitTorrentClient::parse_magnet_link(magnet_link);
+
+        // Step 2: Get peers from tracker
+        auto peers = TrackerClient::get_peers(magnet_info);
+        if (peers.empty()) {
+            std::cerr << "No peers received from tracker." << std::endl;
+            return;
+        }
+
+        std::cout << "Found " << peers.size() << " peers from tracker" << std::endl;
+
+        // Step 3: Retrieve metadata from a peer
+        TorrentInfo torrent_info;
+        bool metadata_retrieved = false;
+
+        for (const auto& peer : peers) {
+            try {
+                std::string peer_id = BitTorrentClient::generate_peer_id();
+
+                // Connect and perform base handshake
+                int sock = PeerConnection::connect_to_peer(peer);
+                if (sock < 0) {
+                    continue;
+                }
+
+                std::array<char, 68> handshake_response{};
+                if (!PeerConnection::perform_handshake(sock, magnet_info.info_hash_raw, peer_id, handshake_response)) {
+                    close(sock);
+                    continue;
+                }
+
+                // Read initial messages
+                try {
+                    uint8_t msg_id = 0;
+                    PeerConnection::recv_message(sock, msg_id);
+                } catch (...) {
+                    // Not critical
+                }
+
+                // Check for extension protocol support
+                bool peer_supports_extensions = false;
+                if (handshake_response.size() >= 68) {
+                    unsigned char reserved5 = static_cast<unsigned char>(handshake_response[25]);
+                    peer_supports_extensions = (reserved5 & 0x10) != 0;
+                }
+
+                if (!peer_supports_extensions) {
+                    close(sock);
+                    continue;
+                }
+
+                // Send extension handshake
+                json ext_dict;
+                ext_dict["m"] = { {"ut_metadata", 1} };
+                std::string bencoded = BencodeParser::json_to_bencode(ext_dict);
+
+                std::vector<uint8_t> ext_payload;
+                ext_payload.push_back(0);
+                ext_payload.insert(ext_payload.end(), bencoded.begin(), bencoded.end());
+                PeerConnection::send_message(sock, 20, ext_payload);
+
+                // Receive extension handshake
+                uint8_t peer_ut_metadata_id = 0;
+                {
+                    uint8_t resp_msg_id = 0;
+                    auto resp_payload = PeerConnection::recv_message(sock, resp_msg_id);
+
+                    if (resp_msg_id == 20 && !resp_payload.empty() && resp_payload[0] == 0) {
+                        std::string benc_str(reinterpret_cast<char*>(resp_payload.data() + 1),
+                                             resp_payload.size() - 1);
+                        json peer_ext_dict = BencodeParser::decode_bencoded_value(benc_str);
+
+                        if (peer_ext_dict.contains("m") &&
+                            peer_ext_dict["m"].is_object() &&
+                            peer_ext_dict["m"].contains("ut_metadata")) {
+                            peer_ut_metadata_id = peer_ext_dict["m"]["ut_metadata"].get<int>();
+                        } else {
+                            close(sock);
+                            continue;
+                        }
+                    } else {
+                        close(sock);
+                        continue;
+                    }
+                }
+
+                // Request metadata piece 0
+                json request_dict;
+                request_dict["msg_type"] = 0;
+                request_dict["piece"] = 0;
+
+                std::string bencoded_request = BencodeParser::json_to_bencode(request_dict);
+                std::vector<uint8_t> request_payload;
+                request_payload.push_back(peer_ut_metadata_id);
+                request_payload.insert(request_payload.end(),
+                                       bencoded_request.begin(),
+                                       bencoded_request.end());
+
+                PeerConnection::send_message(sock, 20, request_payload);
+
+                // Receive metadata response
+                uint8_t metadata_msg_id = 0;
+                auto metadata_payload = PeerConnection::recv_message(sock, metadata_msg_id);
+
+                if (metadata_msg_id != 20 || metadata_payload.empty()) {
+                    close(sock);
+                    continue;
+                }
+
+                std::string full_payload(reinterpret_cast<char*>(metadata_payload.data() + 1),
+                                         metadata_payload.size() - 1);
+
+                // Split dictionary and metadata
+                size_t pos = 0;
+                json metadata_dict = BencodeParser::decode_bencoded_value(full_payload, pos);
+
+                if (!metadata_dict.contains("msg_type") || metadata_dict["msg_type"].get<int>() != 1) {
+                    close(sock);
+                    continue;
+                }
+
+                std::string metadata_content = full_payload.substr(pos);
+                json info_dict = BencodeParser::decode_bencoded_value(metadata_content);
+
+                // Validate SHA1(info) == info_hash
+                std::string reencoded_info = BencodeParser::json_to_bencode(info_dict);
+                std::string computed_hash = CryptoUtils::sha1_to_hex(reencoded_info);
+
+                if (computed_hash != magnet_info.info_hash_hex) {
+                    close(sock);
+                    continue;
+                }
+
+                // Build TorrentInfo from metadata
+                torrent_info.tracker_url = magnet_info.tracker_url;
+                torrent_info.length = info_dict["length"].get<int64_t>();
+                torrent_info.piece_length = info_dict["piece length"].get<int>();
+                torrent_info.info_hash_hex = magnet_info.info_hash_hex;
+                torrent_info.info_hash_raw = magnet_info.info_hash_raw;
+                torrent_info.info_dict = info_dict;
+
+                // Parse piece hashes
+                std::string pieces_raw = info_dict["pieces"].get<std::string>();
+                for (size_t i = 0; i < pieces_raw.size(); i += 20) {
+                    std::array<uint8_t, 20> piece_hash;
+                    memcpy(piece_hash.data(), pieces_raw.data() + i, 20);
+                    torrent_info.piece_hashes.push_back(piece_hash);
+                }
+
+                close(sock);
+
+                std::cout << "Metadata retrieved successfully!" << std::endl;
+                std::cout << "File length: " << torrent_info.length << " bytes" << std::endl;
+                std::cout << "Piece length: " << torrent_info.piece_length << " bytes" << std::endl;
+                std::cout << "Total pieces: " << torrent_info.get_piece_count() << std::endl;
+
+                metadata_retrieved = true;
+                break;
+
+            } catch (const std::exception& e) {
+                // Try next peer
+                continue;
+            }
+        }
+
+        if (!metadata_retrieved) {
+            std::cerr << "Failed to retrieve metadata from any peer." << std::endl;
+            return;
+        }
+
+        // Step 4: Download all pieces using multi-peer strategy
+        auto start_time = std::chrono::steady_clock::now();
+
+        int num_workers = std::min(6, static_cast<int>(std::thread::hardware_concurrency()));
+        std::cout << "Starting download with " << num_workers << " workers" << std::endl;
+
+        BitTorrentClient::download_file_multi_peer(torrent_info, output_file, num_workers);
+
+        auto end_time = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
+
+        double speed_mbps = (torrent_info.length / (1024.0 * 1024.0)) /
+                            std::max(1, static_cast<int>(duration.count()));
+        
+        std::cout << "Download completed in " << duration.count() << " seconds" << std::endl;
+        std::cout << "Average speed: " << std::fixed << std::setprecision(2)
+                  << speed_mbps << " MB/s" << std::endl;
+
+    } catch (const std::exception& e) {
+        std::cerr << "Download failed: " << e.what() << std::endl;
+    }
+}
 
 
 

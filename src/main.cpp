@@ -8,9 +8,21 @@ int main(int argc, char* argv[]) {
     
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <command> <args>" << std::endl;
-        std::cerr << "Commands: decode, info, peers, handshake, download_piece, download, " 
-                  << "magnet_parse, magnet_handshake, magnet_info, magnet_download_piece, magnet_download" 
-                  << std::endl;
+        std::cerr << "\nAvailable commands:" << std::endl;
+        std::cerr << "  Basic:" << std::endl;
+        std::cerr << "    decode <encoded_value>" << std::endl;
+        std::cerr << "    info <file.torrent>" << std::endl;
+        std::cerr << "    peers <file.torrent>" << std::endl;
+        std::cerr << "    handshake <file.torrent> <ip:port>" << std::endl;
+        std::cerr << "\n  Download:" << std::endl;
+        std::cerr << "    download_piece -o <output> <file.torrent> <piece_index>" << std::endl;
+        std::cerr << "    download -o <output> <file.torrent> [--single-peer]" << std::endl;
+        std::cerr << "\n  Magnet Links:" << std::endl;
+        std::cerr << "    magnet_parse <magnet_link>" << std::endl;
+        std::cerr << "    magnet_handshake <magnet_link>" << std::endl;
+        std::cerr << "    magnet_info <magnet_link>" << std::endl;
+        std::cerr << "    magnet_download_piece -o <output> <magnet_link> <piece_index>" << std::endl;
+        std::cerr << "    magnet_download -o <output> <magnet_link>" << std::endl;
         return 1;
     }
     

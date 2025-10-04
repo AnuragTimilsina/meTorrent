@@ -14,4 +14,6 @@ private:
     static void handle_download_piece(const std::vector<std::string>& args);
     static void handle_download(const std::vector<std::string>& args);
     static void handle_magnet_parse(const std::vector<std::string>& args);
+    static void handle_magnet_handshake(const std::vector<std::string>& args);
+    static void handle_magnet_info(const std::vector<std::string>& args);
 };

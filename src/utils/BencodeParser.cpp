@@ -3,39 +3,69 @@
 #include <algorithm>
 
 json BencodeParser::decode_bencoded_value(const std::string& s, size_t& pos) {
-    if (std::isdigit(s[pos])) {
+    if (pos >= s.size()) {
+        throw std::runtime_error("Unexpected end of bencoded string");
+    }
+
+    char c = s[pos];
+
+    if (std::isdigit(c)) {
         size_t colon = s.find(':', pos);
+        if (colon == std::string::npos) {
+            throw std::runtime_error("Invalid bencode string length (missing ':')");
+        }
         int len = std::stoi(s.substr(pos, colon - pos));
         pos = colon + 1;
+        if (pos + len > s.size()) {
+            throw std::runtime_error("Invalid bencode string (length exceeds input)");
+        }
         std::string str = s.substr(pos, len);
         pos += len;
         return json(str);
-    } else if (s[pos] == 'i') {
+
+    } else if (c == 'i') {
         pos++;
         size_t ePos = s.find('e', pos);
+        if (ePos == std::string::npos) {
+            throw std::runtime_error("Invalid bencode integer (missing 'e')");
+        }
         long long value = std::stoll(s.substr(pos, ePos - pos));
         pos = ePos + 1;
         return json(value);
-    } else if (s[pos] == 'l') {
+
+    } else if (c == 'l') {
         pos++;
         json arr = json::array();
-        while (s[pos] != 'e') {
+        while (pos < s.size() && s[pos] != 'e') {
             arr.push_back(decode_bencoded_value(s, pos));
         }
-        pos++;
+        if (pos >= s.size()) {
+            throw std::runtime_error("Unterminated bencode list");
+        }
+        pos++; // skip 'e'
         return arr;
-    } else if (s[pos] == 'd') {
+
+    } else if (c == 'd') {
         pos++;
         json obj = json::object();
-        while (s[pos] != 'e') {
+        while (pos < s.size() && s[pos] != 'e') {
             json key = decode_bencoded_value(s, pos);
+            if (!key.is_string()) {
+                throw std::runtime_error("Bencode dictionary key is not a string");
+            }
             json value = decode_bencoded_value(s, pos);
             obj[key.get<std::string>()] = value;
         }
-        pos++;
+        if (pos >= s.size()) {
+            throw std::runtime_error("Unterminated bencode dictionary");
+        }
+        pos++; // skip 'e'
         return obj;
+
     } else {
-        throw std::runtime_error("Unhandled encoded value: " + s);
+        throw std::runtime_error("Unhandled encoded value at pos " +
+                                 std::to_string(pos) +
+                                 " (char='" + std::string(1, c) + "')");
     }
 }
 
@@ -43,6 +73,7 @@ json BencodeParser::decode_bencoded_value(const std::string& s) {
     size_t pos = 0;
     return decode_bencoded_value(s, pos);
 }
+
 
 std::string BencodeParser::json_to_bencode(const json& j) {
     if (j.is_string()) {

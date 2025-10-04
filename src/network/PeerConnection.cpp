@@ -76,7 +76,11 @@ bool PeerConnection::perform_handshake(int sock,
     std::string handshake;
     handshake += static_cast<char>(19);
     handshake += "BitTorrent protocol";
-    handshake += std::string(8, '\0');
+    
+    std::array<char, 8> reserved = {0};
+    reserved[5] = 0x10; 
+    handshake.append(reserved.data(), reserved.size());                                   
+
     handshake += info_hash;
     handshake += peer_id;
 
@@ -97,6 +101,7 @@ bool PeerConnection::perform_handshake(int sock,
         total_read += n;
     }
 
+    
     std::string received_info_hash(response_out.data() + 28, 20);
     if (received_info_hash != info_hash) {
         std::cerr << "Info hash mismatch in handshake response." << std::endl;

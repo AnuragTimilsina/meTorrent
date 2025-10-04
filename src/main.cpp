@@ -8,7 +8,7 @@ int main(int argc, char* argv[]) {
     
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <command> <args>" << std::endl;
-        std::cerr << "Commands: decode, info, peers, handshake, download_piece, download, magnet_parse" << std::endl;
+        std::cerr << "Commands: decode, info, peers, handshake, download_piece, download, magnet_parse, magnet_handshake, magnet_info" << std::endl;
         return 1;
     }
     
